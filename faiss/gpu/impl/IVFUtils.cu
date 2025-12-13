@@ -18,15 +18,58 @@
 namespace faiss {
 namespace gpu {
 
-size_t getIVFKSelectionPass2Chunks(size_t nprobe) {
-    // We run two passes of heap selection
-    // This is the size of the second-level heap passes
-    constexpr size_t kNProbeSplit = 8;
-    return std::min(nprobe, kNProbeSplit);
+// baseline
+// size_t getIVFKSelectionPass2Chunks(size_t nprobe) {
+//     // Legacy fallback: fixed small split improves parallelism without
+//     // increasing temporary memory excessively.
+//     constexpr size_t kNProbeSplit = 8;
+//     return std::min(nprobe, kNProbeSplit);
+// }
+
+static inline size_t roundUpPow2(size_t x) {
+    if (x <= 1) return 1;
+    --x;
+    x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16;
+#if SIZE_MAX > UINT32_MAX
+    x |= x >> 32;
+#endif
+    return x + 1;
+}
+
+size_t getIVFKSelectionPass2Chunks(size_t nprobe, size_t queryTileSize, int k) {
+    if (nprobe <= 8) return nprobe; // For small nprobe, merge overhead is dominant
+
+    double tileFactor = 1.0;
+    if (queryTileSize <= 256) tileFactor = 2.0;
+    else if (queryTileSize <= 512) tileFactor = 1.5;
+    else tileFactor = 1.0;
+
+    double probeFactor = (nprobe >= 256) ? 2.0 :
+                         (nprobe >= 128) ? 1.5 :
+                         (nprobe >= 64)  ? 1.0 : 0.75;
+
+    double kFactor = (k >= 1024) ? 2.0 :
+                     (k >= 512)  ? 1.5 :
+                     (k >= 128)  ? 1.0 : 0.75;
+
+    double raw = 8 * tileFactor * probeFactor * kFactor;
+
+    size_t chunks = roundUpPow2((size_t)raw);
+    const size_t minChunks = 4;           // To prevent underutilization of SM
+    const size_t maxChunks = 32;          // To prevent too much merge overhead
+    chunks = std::min(chunks, maxChunks);
+    chunks = std::max(chunks, minChunks);
+    chunks = std::min(chunks, nprobe);
+    return chunks;
 }
 
 size_t getIVFPerQueryTempMemory(size_t k, size_t nprobe, size_t maxListLength) {
-    size_t pass2Chunks = getIVFKSelectionPass2Chunks(nprobe);
+    size_t pass2Chunks = getIVFKSelectionPass2Chunks(nprobe, maxListLength, k);
+    return getIVFPerQueryTempMemory(k, nprobe, maxListLength, pass2Chunks);
+}
+
+size_t getIVFPerQueryTempMemory(
+        size_t k, size_t nprobe, size_t maxListLength, size_t pass2Chunks) {
 
     size_t sizeForFirstSelectPass =
             pass2Chunks * k * (sizeof(float) + sizeof(idx_t));
@@ -61,7 +104,25 @@ size_t getIVFPQPerQueryTempMemory(
     // The IVF-generic temp memory allocation already takes this multi-streaming
     // into account, but we need to do so for the PQ residual distances too
     return (2 * residualDistances) +
-            getIVFPerQueryTempMemory(k, nprobe, maxListLength);
+            getIVFPerQueryTempMemory(k, nprobe, maxListLength,
+                                     getIVFKSelectionPass2Chunks(nprobe, (size_t)maxListLength, k));
+}
+
+size_t getIVFPQPerQueryTempMemory(
+        size_t k,
+        size_t nprobe,
+        size_t maxListLength,
+        bool usePrecomputedCodes,
+        size_t numSubQuantizers,
+        size_t numSubQuantizerCodes,
+        size_t pass2Chunks) {
+    size_t residualDistances = usePrecomputedCodes
+            ? 0
+            : (nprobe * numSubQuantizers * numSubQuantizerCodes *
+               sizeof(float));
+
+    return (2 * residualDistances) +
+            getIVFPerQueryTempMemory(k, nprobe, maxListLength, pass2Chunks);
 }
 
 size_t getIVFQueryTileSize(

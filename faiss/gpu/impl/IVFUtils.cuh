@@ -23,14 +23,29 @@ class GpuResources;
 /// The first pass scans some number of per-IVF list distances reducing them to
 /// at most 8, then a second pass processes these <= 8 to the single final list
 /// of NN candidates
-size_t getIVFKSelectionPass2Chunks(size_t nprobe);
+// Legacy heuristic: returns min(nprobe, 8)
+size_t getIVFKSelectionPass2Chunks(size_t nprobe, size_t queryTileSize, int k);
+
+// Tuned heuristic: choose number of second-pass merge chunks based on
+// nprobe, query tile size and device SM count, with a soft cap by k.
+// This aims to keep enough blocks in flight (≈4x SM) while balancing
+// temporary memory usage.
+size_t getIVFKSelectionPass2Chunks(
+        size_t nprobe,
+        size_t queryTileSize,
+        int k);
 
 /// Function to determine amount of temporary space that we allocate
 /// for storing basic IVF list scanning distances during query, based on the
 /// memory allocation per query. This is the memory requirement for
 /// IVFFlat/IVFSQ but IVFPQ will add some additional allocation as well (see
 /// getIVFPQPerQueryTempMemory)
+// Per-query temporary memory estimate (legacy pass2Chunks heuristic inside)
 size_t getIVFPerQueryTempMemory(size_t k, size_t nprobe, size_t maxListLength);
+
+// Per-query temporary memory with caller-provided pass2Chunks
+size_t getIVFPerQueryTempMemory(
+        size_t k, size_t nprobe, size_t maxListLength, size_t pass2Chunks);
 
 /// Function to determine amount of temporary space that we allocate
 /// for storing basic IVFPQ list scanning distances during query, based on the
@@ -42,6 +57,16 @@ size_t getIVFPQPerQueryTempMemory(
         bool usePrecomputedCodes,
         size_t numSubQuantizers,
         size_t numSubQuantizerCodes);
+
+// With caller-provided pass2Chunks
+size_t getIVFPQPerQueryTempMemory(
+        size_t k,
+        size_t nprobe,
+        size_t maxListLength,
+        bool usePrecomputedCodes,
+        size_t numSubQuantizers,
+        size_t numSubQuantizerCodes,
+        size_t pass2Chunks);
 
 /// Based on the amount of temporary memory needed per IVF query (determined by
 /// one of the above functions) and the amount of current temporary memory

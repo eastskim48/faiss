@@ -18,6 +18,8 @@
 #include <faiss/gpu/utils/LoadStoreOperators.cuh>
 #include <faiss/gpu/utils/NoTypeTensor.cuh>
 #include <faiss/gpu/utils/WarpPackedBits.cuh>
+#include <cstdio>
+#include <cstdlib>
 
 namespace faiss {
 namespace gpu {
@@ -570,8 +572,8 @@ void runPQScanMultiPassNoPrecomputed(
             res, makeTempAlloc(AllocType::Other, stream), {kThrustMemSize});
     DeviceTensor<char, 1, true>* thrustMem[2] = {&thrustMem1, &thrustMem2};
 
-    // How much temporary memory would we need to handle a single query?
-    size_t sizePerQuery = getIVFPQPerQueryTempMemory(
+    // First pass: estimate tile size with legacy heuristic
+    size_t sizePerQueryLegacy = getIVFPQPerQueryTempMemory(
             k,
             nprobe,
             maxListLength,
@@ -579,11 +581,10 @@ void runPQScanMultiPassNoPrecomputed(
             numSubQuantizers,
             numSubQuantizerCodes);
 
-    // How many queries do we wish to run at once?
     idx_t queryTileSize = getIVFQueryTileSize(
             queries.getSize(0),
             res->getTempMemoryAvailableCurrentDevice(),
-            sizePerQuery);
+            sizePerQueryLegacy);
 
     // Temporary memory buffers
     // Make sure there is space prior to the start which will be 0, and
@@ -649,7 +650,67 @@ void runPQScanMultiPassNoPrecomputed(
     DeviceTensor<float, 1, true>* allDistances[2] = {
             &allDistances1, &allDistances2};
 
-    idx_t pass2Chunks = getIVFKSelectionPass2Chunks(nprobe);
+    int smCount = getCurrentDeviceProperties().multiProcessorCount;
+    // Determine tuned pass2Chunks and adjust tile size if needed
+    size_t pass2ChunksLegacy = getIVFKSelectionPass2Chunks(nprobe, (size_t)queryTileSize, k);
+    bool useTuned = true;
+    if (const char* tg = std::getenv("FAISS_GPU_IVF_TUNED_CHUNKS")) {
+        if (tg[0] == '0' || tg[0] == '\0') useTuned = false;
+    }
+    idx_t pass2Chunks = (idx_t)pass2ChunksLegacy;
+    if (useTuned) {
+        idx_t tuned = getIVFKSelectionPass2Chunks(
+                nprobe, (size_t)queryTileSize, k);
+        size_t sizePerQueryTuned = getIVFPQPerQueryTempMemory(
+                k,
+                nprobe,
+                maxListLength,
+                false,
+                numSubQuantizers,
+                numSubQuantizerCodes,
+                (size_t)tuned);
+        auto tempAvail = res->getTempMemoryAvailableCurrentDevice();
+        idx_t maxTileByTuned = std::max<idx_t>(
+                1, (idx_t)(tempAvail /
+                           (sizePerQueryTuned ? sizePerQueryTuned : 1)));
+        if (queryTileSize > maxTileByTuned) {
+            queryTileSize = maxTileByTuned;
+        }
+        pass2Chunks = tuned;
+
+        if (const char* dbg = std::getenv("FAISS_GPU_IVF_DEBUG")) {
+            if (dbg[0] != '\0' && dbg[0] != '0') {
+                std::printf(
+                        "[faiss][IVFPQ nopre] tuned=1 nprobe=%ld k=%d sm=%d "
+                        "tile(legacy)=%ld pass2Chunks=%ld sizeLegacy=%zu "
+                        "sizeTuned=%zu tempAvail=%zu tile(clamped)=%ld\n",
+                        (long)nprobe,
+                        k,
+                        smCount,
+                        (long)(res->getTempMemoryAvailableCurrentDevice() /
+                               (sizePerQueryLegacy ? sizePerQueryLegacy : 1)),
+                        (long)pass2Chunks,
+                        (size_t)sizePerQueryLegacy,
+                        (size_t)sizePerQueryTuned,
+                        (size_t)tempAvail,
+                        (long)queryTileSize);
+            }
+        }
+    } else {
+        if (const char* dbg = std::getenv("FAISS_GPU_IVF_DEBUG")) {
+            if (dbg[0] != '\0' && dbg[0] != '0') {
+                std::printf(
+                        "[faiss][IVFPQ nopre] tuned=0 nprobe=%ld k=%d pass2Chunks=%ld "
+                        "tile(legacy)=%ld sizeLegacy=%zu\n",
+                        (long)nprobe,
+                        k,
+                        (long)pass2Chunks,
+                        (long)(res->getTempMemoryAvailableCurrentDevice() /
+                               (sizePerQueryLegacy ? sizePerQueryLegacy : 1)),
+                        (size_t)sizePerQueryLegacy);
+            }
+        }
+    }
     DeviceTensor<float, 3, true> heapDistances1(
             res,
             makeTempAlloc(AllocType::Other, stream),

@@ -21,6 +21,8 @@
 #include <faiss/gpu/utils/Reductions.cuh>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace faiss {
 namespace gpu {
@@ -364,14 +366,76 @@ void runIVFFlatScan(
             res, makeTempAlloc(AllocType::Other, stream), {kThrustMemSize});
     DeviceTensor<char, 1, true>* thrustMem[2] = {&thrustMem1, &thrustMem2};
 
-    // How much temporary memory would we need to handle a single query?
-    size_t sizePerQuery = getIVFPerQueryTempMemory(k, nprobe, maxListLength);
-
-    // How many queries do we wish to run at once?
+    // First pass: estimate tile size with legacy heuristic
+    size_t sizePerQueryLegacy =
+            getIVFPerQueryTempMemory(k, nprobe, maxListLength);
     idx_t queryTileSize = getIVFQueryTileSize(
             queries.getSize(0),
             res->getTempMemoryAvailableCurrentDevice(),
-            sizePerQuery);
+            sizePerQueryLegacy);
+
+    // Determine pass2Chunks; allow disabling tuned heuristic via env
+    size_t pass2ChunksLegacy = getIVFKSelectionPass2Chunks(nprobe, (size_t)queryTileSize, k);
+    bool useTuned = true;
+    if (const char* tg = std::getenv("FAISS_GPU_IVF_TUNED_CHUNKS")) {
+        if (tg[0] == '0' || tg[0] == '\0') {
+            useTuned = false;
+        }
+    }
+
+    idx_t pass2Chunks = (idx_t)pass2ChunksLegacy;
+    if (useTuned) {
+        int smCount = getCurrentDeviceProperties().multiProcessorCount;
+        idx_t tunedPass2Chunks = getIVFKSelectionPass2Chunks(
+                nprobe, (size_t)queryTileSize, k);
+        size_t sizePerQueryTuned = getIVFPerQueryTempMemory(
+                k, nprobe, maxListLength, (size_t)tunedPass2Chunks);
+
+        // If tuned estimate reduces tile, clamp it
+        auto tempAvail = res->getTempMemoryAvailableCurrentDevice();
+        idx_t maxTileByTuned = std::max<idx_t>(
+                1, (idx_t)(tempAvail /
+                           (sizePerQueryTuned ? sizePerQueryTuned : 1)));
+        if (queryTileSize > maxTileByTuned) {
+            queryTileSize = maxTileByTuned;
+        }
+
+        pass2Chunks = tunedPass2Chunks;
+
+        // Optional debug log
+        if (const char* dbg = std::getenv("FAISS_GPU_IVF_DEBUG")) {
+            if (dbg[0] != '\0' && dbg[0] != '0') {
+                std::printf(
+                        "[faiss][IVFFlat] tuned=1 nprobe=%ld k=%d sm=%d "
+                        "tile(legacy)=%ld pass2Chunks=%ld sizeLegacy=%zu "
+                        "sizeTuned=%zu tempAvail=%zu tile(clamped)=%ld\n",
+                        (long)nprobe,
+                        k,
+                        smCount,
+                        (long)(res->getTempMemoryAvailableCurrentDevice() /
+                               (sizePerQueryLegacy ? sizePerQueryLegacy : 1)),
+                        (long)tunedPass2Chunks,
+                        (size_t)sizePerQueryLegacy,
+                        (size_t)sizePerQueryTuned,
+                        (size_t)tempAvail,
+                        (long)queryTileSize);
+            }
+        }
+    } else {
+        if (const char* dbg = std::getenv("FAISS_GPU_IVF_DEBUG")) {
+            if (dbg[0] != '\0' && dbg[0] != '0') {
+                std::printf(
+                        "[faiss][IVFFlat] tuned=0 nprobe=%ld k=%d pass2Chunks=%ld "
+                        "tile(legacy)=%ld sizeLegacy=%zu\n",
+                        (long)nprobe,
+                        k,
+                        (long)pass2Chunks,
+                        (long)(res->getTempMemoryAvailableCurrentDevice() /
+                               (sizePerQueryLegacy ? sizePerQueryLegacy : 1)),
+                        (size_t)sizePerQueryLegacy);
+            }
+        }
+    }
 
     // Temporary memory buffers
     // Make sure there is space prior to the start which will be 0, and
@@ -410,7 +474,9 @@ void runIVFFlatScan(
     DeviceTensor<float, 1, true>* allDistances[2] = {
             &allDistances1, &allDistances2};
 
-    idx_t pass2Chunks = getIVFKSelectionPass2Chunks(nprobe);
+    // Heuristic: choose number of second-pass merge chunks based on SMs and tile size
+    int smCount = getCurrentDeviceProperties().multiProcessorCount;
+    // pass2Chunks already chosen above (tuned or legacy)
     DeviceTensor<float, 3, true> heapDistances1(
             res,
             makeTempAlloc(AllocType::Other, stream),
